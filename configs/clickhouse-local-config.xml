@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <logger>
+        <level>information</level>
+        <console>true</console>
+    </logger>
+
+    <http_port replace="1">8123</http_port>
+    <tcp_port replace="1">9000</tcp_port>
+
+    <path replace="1">clickhouse-data/</path>
+    <tmp_path replace="1">clickhouse-data/tmp/</tmp_path>
+    <user_files_path replace="1">clickhouse-data/user_files/</user_files_path>
+    <format_schema_path replace="1">clickhouse-data/format_schemas/</format_schema_path>
+
+    <listen_host>0.0.0.0</listen_host>
+    <listen_host>::</listen_host>
+
+    <users>
+        <default>
+            <profile>default</profile>
+            <quota>default</quota>
+            <password></password>
+            <networks>
+                <ip>0.0.0.0/0</ip>
+                <ip>::/0</ip>
+            </networks>
+        </default>
+    </users>
+
+    <profiles>
+        <default>
+            <max_memory_usage>4G</max_memory_usage>
+        </default>
+    </profiles>
+
+    <quotas>
+        <default />
+    </quotas>
+</clickhouse>

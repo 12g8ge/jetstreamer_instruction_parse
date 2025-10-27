@@ -1,3 +1,8 @@
 /target
 /bin
 /.serena
+/scripts 
+/.env
+/data/
+/iq-plugin/.env
+.DS_Store
