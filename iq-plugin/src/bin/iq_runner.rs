@@ -7,6 +7,11 @@ use jetstreamer::JetstreamerRunner;
 use serde::Deserialize;
 use serde_json::json;
 use solana_pubkey::Pubkey;
+use tokio::time::{sleep, Duration};
+
+const SIGNATURE_PAGE_LIMIT: usize = 1_000;
+const DEFAULT_MAX_SIGNATURE_PAGES: usize = 25;
+const PAGE_DELAY_MS: u64 = 50;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,7 +38,7 @@ struct CliArgs {
     slot_padding: u64,
 
     /// Maximum number of requests per PDA when fetching signatures (each fetch pulls 1,000 signatures)
-    #[arg(long, default_value_t = 10, value_name = "REQUESTS")]
+    #[arg(long, default_value_t = DEFAULT_MAX_SIGNATURE_PAGES, value_name = "REQUESTS")]
     max_signature_pages: usize,
 
     /// Firehose worker threads override (defaults to JETSTREAMER_THREADS or auto sizing)
@@ -47,6 +52,11 @@ struct CliArgs {
 
 fn main() -> Result<()> {
     let args = CliArgs::parse();
+
+    // Initialize logging before we perform any signature discovery so that
+    // `log!` invocations inside helper utilities are visible even if Jetstreamer
+    // reconfigures the logger later on.
+    solana_logger::setup_with_default(&args.log_level);
 
     let plugin = IQSessionPlugin::new().context("failed to configure IQ session plugin")?;
 
@@ -184,10 +194,27 @@ async fn fetch_bounds_for_pda(
     let mut before: Option<String> = None;
     let mut min_slot: Option<u64> = None;
     let mut max_slot: Option<u64> = None;
-    const PAGE_LIMIT: usize = 1_000;
+    let mut pages_fetched: usize = 0;
+    let mut total_signatures: usize = 0;
 
-    for _ in 0..max_pages {
-        let mut params = json!([pda.to_string(), { "limit": PAGE_LIMIT }]);
+    loop {
+        if pages_fetched >= max_pages {
+            log::warn!(
+                "PDA {} signature history truncated at {} pages (oldest slot seen: {:?})",
+                pda,
+                max_pages,
+                min_slot
+            );
+            break;
+        }
+
+        let mut params = json!([
+            pda.to_string(),
+            {
+                "limit": SIGNATURE_PAGE_LIMIT,
+                "commitment": "confirmed"
+            }
+        ]);
         if let Some(ref before_sig) = before {
             params[1]["before"] = json!(before_sig);
         }
@@ -223,6 +250,19 @@ async fn fetch_bounds_for_pda(
         if entries.is_empty() {
             break;
         }
+        pages_fetched += 1;
+        total_signatures += entries.len();
+
+        let newest_slot = entries.first().map(|r| r.slot).unwrap_or_default();
+        let oldest_slot = entries.last().map(|r| r.slot).unwrap_or_default();
+        log::debug!(
+            "PDA {} page {} fetched {} signatures (slots {}..{})",
+            pda,
+            pages_fetched,
+            entries.len(),
+            oldest_slot,
+            newest_slot
+        );
 
         for record in &entries {
             min_slot = Some(min_slot.map(|m| m.min(record.slot)).unwrap_or(record.slot));
@@ -231,10 +271,22 @@ async fn fetch_bounds_for_pda(
 
         before = entries.last().map(|r| r.signature.clone());
 
-        if entries.len() < PAGE_LIMIT {
+        if entries.len() < SIGNATURE_PAGE_LIMIT {
             break;
         }
+
+        // Avoid hammering public RPC endpoints; a short pause keeps us under burst limits.
+        sleep(Duration::from_millis(PAGE_DELAY_MS)).await;
     }
+
+    log::info!(
+        "PDA {} signature sweep fetched {} page(s) / {} signatures (slots {:?}..{:?})",
+        pda,
+        pages_fetched,
+        total_signatures,
+        min_slot,
+        max_slot
+    );
 
     Ok((min_slot, max_slot))
 }

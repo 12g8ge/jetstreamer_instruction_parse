@@ -9,10 +9,11 @@ reader API.
 
 Set the following variables before starting the runner:
 
-- `IQ_PROGRAM_ID` – Base58 program id for the IQ protocol. Optional when you only care about
-  a fixed set of session PDAs.  
-- `IQ_SESSION_PDA_LIST` – Comma-separated list of session PDA addresses to force collection
-  even if the program id does not match. Optional.
+- `IQ_PROGRAM_ID` – Base58 program id(s) for the IQ protocol. Accepts a single id or a
+  comma-separated list. Optional when you only care about a fixed set of session PDAs.  
+- `IQ_SESSION_PDA_LIST` – Comma-separated list of session PDA addresses to focus on. When
+  this list is non-empty, the plugin ignores sessions outside the list even if the program
+  id matches. Optional.
 - `IQ_READER_MODE` – `pinocchio`, `legacy`, or `passthrough`. The default is
   `pinocchio`; `passthrough` attempts both parsers.
 - `IQ_READER_BASE_URL` – Base URL for the reader backend (default:

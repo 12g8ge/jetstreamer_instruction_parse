@@ -3,6 +3,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use reqwest::{Client, Url};
+use serde_json::json;
 use solana_address::Address;
 use solana_geyser_plugin_manager::{
     block_metadata_notifier_interface::BlockMetadataNotifier,
@@ -18,10 +19,12 @@ use solana_rpc::{
 use solana_runtime::bank::{KeyedRewardsAndNumPartitions, RewardType};
 use solana_sdk_ids::vote::id as vote_program_id;
 use solana_transaction::versioned::VersionedTransaction;
+const FIREHOSE_ERROR_LOG: &str = "firehose_error_hints.log";
 use std::{
     fmt::Display,
+    fs::OpenOptions,
     future::Future,
-    io,
+    io::{self, Write},
     ops::Range,
     path::PathBuf,
     sync::{
@@ -81,6 +84,45 @@ fn is_shutdown_error(err: &FirehoseError) -> bool {
         | FirehoseError::RewardHandlerError(inner)
         | FirehoseError::OnStatsHandlerError(inner) => is_interrupted(inner.as_ref()),
         _ => false,
+    }
+}
+
+fn record_firehose_error(
+    thread_index: Option<usize>,
+    slot_range: &Range<u64>,
+    slot: u64,
+    item_index: usize,
+    err: &FirehoseError,
+) {
+    let record = json!({
+        "thread": thread_index,
+        "slot": slot,
+        "epoch": slot_to_epoch(slot),
+        "slot_range_start": slot_range.start,
+        "slot_range_end": slot_range.end,
+        "item_index": item_index,
+        "error": format!("{err}"),
+        "recommendation": {
+            "SlotRange": format!("{}:{}", slot.saturating_sub(1), slot_range.end)
+        }
+    });
+    if let Ok(line) = serde_json::to_string(&record) {
+        append_error_line(&line);
+    }
+}
+
+fn append_error_line(line: &str) {
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(FIREHOSE_ERROR_LOG)
+    {
+        Ok(mut file) => {
+            if let Err(err) = writeln!(file, "{line}") {
+                log::debug!(target: LOG_MODULE, "failed to write firehose error hint: {}", err);
+            }
+        }
+        Err(err) => log::debug!(target: LOG_MODULE, "failed to open firehose error log: {}", err),
     }
 }
 
@@ -637,6 +679,9 @@ where
                     // for each item in each block
                     let mut item_index = 0;
                     let mut displayed_skip_message = false;
+                    let mut expecting_recovery_slot = skip_until_index.is_none() && current_slot.is_some();
+                    let expected_recovery_slot = if expecting_recovery_slot { slot_range.start } else { 0 };
+
                     loop {
                         if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
                             log::info!(
@@ -682,6 +727,39 @@ where
                             block.slot
                         );
                         let slot = block.slot;
+
+                        // Verify we're reading the correct slot after error recovery
+                        if expecting_recovery_slot {
+                            if slot == expected_recovery_slot {
+                                log::info!(
+                                    target: &log_target,
+                                    "✓ recovery verified: successfully reading slot {} after error",
+                                    slot
+                                );
+                                expecting_recovery_slot = false;
+                            } else if slot > expected_recovery_slot {
+                                log::error!(
+                                    target: &log_target,
+                                    "❌ recovery failed: expected slot {} but got slot {} (skipped {} slots)",
+                                    expected_recovery_slot,
+                                    slot,
+                                    slot - expected_recovery_slot
+                                );
+                                // Force a retry by returning an error for the expected slot
+                                return Err((
+                                    FirehoseError::ReadUntilBlockError(Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        format!(
+                                            "Recovery verification failed: sought to slot {} but read slot {} instead",
+                                            expected_recovery_slot, slot
+                                        )
+                                    ))),
+                                    expected_recovery_slot
+                                ));
+                            }
+                            // If slot < expected_recovery_slot, keep reading (might be catching up)
+                        }
+
                         if slot >= slot_range.end {
                             log::info!(target: &log_target, "reached end of slot range at slot {}", slot);
                             // Return early to terminate the firehose thread cleanly. We use >=
@@ -1315,15 +1393,29 @@ where
                 };
                 // Increment this thread's error counter
                 error_counts[thread_index].fetch_add(1, Ordering::Relaxed);
-                log::warn!(
-                    target: &log_target,
-                    "restarting from slot {} at index {}",
-                    slot,
-                    item_index,
-                );
-                // Update slot range to resume from the failed slot, not the original start
-                slot_range.start = slot;
-                skip_until_index = Some(item_index);
+
+                // For full-slot failures (item_index = 0), we need to ensure the failed slot
+                // is actually re-processed after seek. The normal flow can skip it due to
+                // stream positioning issues after timeout.
+                if item_index == 0 {
+                    log::warn!(
+                        target: &log_target,
+                        "full slot failure at {}; will explicitly verify recovery",
+                        slot
+                    );
+                    // Mark that we need to verify the next slot read matches our target
+                    slot_range.start = slot;
+                    skip_until_index = None; // Don't use skip logic for full-slot recovery
+                } else {
+                    log::warn!(
+                        target: &log_target,
+                        "partial slot failure at {} index {}; restarting from that point",
+                        slot,
+                        item_index
+                    );
+                    slot_range.start = slot;
+                    skip_until_index = Some(item_index);
+                }
             }
         });
         handles.push(handle);
@@ -1572,6 +1664,9 @@ async fn firehose_geyser_thread(
                 // for each item in each block
                 let mut item_index = 0;
                 let mut displayed_skip_message = false;
+                let mut expecting_recovery_slot = skip_until_index.is_none() && current_slot.is_some();
+                let expected_recovery_slot = if expecting_recovery_slot { slot_range.start } else { 0 };
+
                 loop {
                     let read_fut = reader.read_until_block();
                     let nodes = match timeout(OP_TIMEOUT, read_fut).await {
@@ -1616,6 +1711,39 @@ async fn firehose_geyser_thread(
                         block.slot
                     );
                     let slot = block.slot;
+
+                    // Verify we're reading the correct slot after error recovery
+                    if expecting_recovery_slot {
+                        if slot == expected_recovery_slot {
+                            log::info!(
+                                target: &log_target,
+                                "✓ recovery verified: successfully reading slot {} after error",
+                                slot
+                            );
+                            expecting_recovery_slot = false;
+                        } else if slot > expected_recovery_slot {
+                            log::error!(
+                                target: &log_target,
+                                "❌ recovery failed: expected slot {} but got slot {} (skipped {} slots)",
+                                expected_recovery_slot,
+                                slot,
+                                slot - expected_recovery_slot
+                            );
+                            // Force a retry by returning an error for the expected slot
+                            return Err((
+                                FirehoseError::ReadUntilBlockError(Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!(
+                                        "Recovery verification failed: sought to slot {} but read slot {} instead",
+                                        expected_recovery_slot, slot
+                                    )
+                                ))),
+                                expected_recovery_slot
+                            ));
+                        }
+                        // If slot < expected_recovery_slot, keep reading (might be catching up)
+                    }
+
                     if slot >= slot_range.end {
                         log::info!(target: &log_target, "reached end of slot range at slot {}", slot);
                         // Return early to terminate the firehose thread cleanly. We use >=
@@ -1858,18 +1986,33 @@ async fn firehose_geyser_thread(
                 FirehoseError::NodeDecodingError(item_index, _) => item_index,
                 _ => 0,
             };
+            record_firehose_error(thread_index, &slot_range, slot, item_index, &err);
             // Increment this thread's error counter
             let idx = thread_index.unwrap_or(0);
             error_counts[idx].fetch_add(1, Ordering::Relaxed);
-            log::warn!(
-                target: &log_target,
-                "restarting from slot {} at index {}",
-                slot,
-                item_index,
-            );
-            // Update slot range to resume from the failed slot, not the original start
-            slot_range.start = slot;
-            skip_until_index = Some(item_index);
+
+            // For full-slot failures (item_index = 0), we need to ensure the failed slot
+            // is actually re-processed after seek. The normal flow can skip it due to
+            // stream positioning issues after timeout.
+            if item_index == 0 {
+                log::warn!(
+                    target: &log_target,
+                    "full slot failure at {}; will explicitly verify recovery",
+                    slot
+                );
+                // Mark that we need to verify the next slot read matches our target
+                slot_range.start = slot;
+                skip_until_index = None; // Don't use skip logic for full-slot recovery
+            } else {
+                log::warn!(
+                    target: &log_target,
+                    "partial slot failure at {} index {}; restarting from that point",
+                    slot,
+                    item_index
+                );
+                slot_range.start = slot;
+                skip_until_index = Some(item_index);
+            }
     }
     Ok(())
 }
@@ -1940,7 +2083,7 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
     let slots_per_thread = total / threads;
     let remainder = total % threads;
 
-    let ranges: Vec<Range<u64>> = (0..threads)
+    let mut ranges: Vec<Range<u64>> = (0..threads)
         .map(|i| {
             // Distribute remainder slots to the first `remainder` threads
             let extra_slot = if i < remainder { 1 } else { 0 };
@@ -1950,32 +2093,56 @@ pub fn generate_subranges(slot_range: &Range<u64>, threads: u64) -> Vec<Range<u6
         })
         .collect();
 
-    // Verify that ranges cover all slots exactly
-    let total_covered: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+    // Extend all ranges except the last by 1 slot to create intentional overlap at boundaries
+    // This prevents boundary slots from being skipped due to seek/stream positioning issues
+    for i in 0..(ranges.len() - 1) {
+        let original_end = ranges[i].end;
+        ranges[i] = ranges[i].start..(original_end + 1);
+        log::debug!(
+            target: LOG_MODULE,
+            "Thread {} range extended to include boundary slot {} (now {}..{})",
+            i,
+            original_end,
+            ranges[i].start,
+            ranges[i].end
+        );
+    }
+
+    // Verify that ranges cover all slots (accounting for overlaps)
+    // Each boundary slot is now covered by 2 threads
+    let unique_slots: std::collections::HashSet<u64> = ranges
+        .iter()
+        .flat_map(|r| r.clone())
+        .collect();
     assert_eq!(
-        total_covered, total,
-        "Range generation failed: {} threads should cover {} slots but only cover {}",
-        threads, total, total_covered
+        unique_slots.len() as u64,
+        total,
+        "Range generation failed: {} threads should cover {} unique slots but cover {}",
+        threads,
+        total,
+        unique_slots.len()
     );
 
-    // Verify no gaps between ranges
+    // Verify all boundary slots are covered by exactly 2 threads
     for i in 1..ranges.len() {
-        assert_eq!(
-            ranges[i - 1].end,
-            ranges[i].start,
-            "Gap found between thread {} (ends at {}) and thread {} (starts at {})",
+        let boundary_slot = ranges[i].start;
+        let covered_by_prev = ranges[i - 1].contains(&boundary_slot);
+        let covered_by_curr = ranges[i].contains(&boundary_slot);
+        assert!(
+            covered_by_prev && covered_by_curr,
+            "Boundary slot {} between thread {} and {} is not covered by both threads",
+            boundary_slot,
             i - 1,
-            ranges[i - 1].end,
-            i,
-            ranges[i].start
+            i
         );
     }
 
     log::info!(
         target: LOG_MODULE,
-        "Generated {} thread ranges covering {} slots total",
+        "Generated {} thread ranges with 1-slot overlaps at boundaries (covering {} unique slots, {} total with overlaps)",
         threads,
-        total_covered
+        total,
+        ranges.iter().map(|r| r.end - r.start).sum::<u64>()
     );
     ranges
 }
